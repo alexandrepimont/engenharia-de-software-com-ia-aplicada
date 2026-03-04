@@ -12,17 +12,17 @@ const WEIGHTS = {
 };
 
 const normalize = (value, min, max) => (value - min) / ((max - min) || 1);
-function makeContext(catalog, users) {
+function makeContext(product, users) {
     const ages = users.map(u => u.age);
-    const price = catalog.map(p => p.price);
+    const price = product.map(p => p.price);
 
     const minAge = Math.min(...ages);
     const maxAge = Math.max(...ages);
     const minPrice = Math.min(...price);
     const maxPrice = Math.max(...price);
 
-    const colors =[...new Set(catalog.map(p => p.color))];
-    const categories = [...new Set(catalog.map(p => p.category))];
+    const colors =[...new Set(product.map(p => p.color))];
+    const categories = [...new Set(product.map(p => p.category))];
     
     const colorIndex = Object.fromEntries(
         colors.map((color, index) => {
@@ -45,7 +45,7 @@ function makeContext(catalog, users) {
         })
     })
     const productAvgAgeNorm = Object.fromEntries(
-        catalog.map(product => {
+        product.map(product => {
             const avg = ageCounts[product.name] ?
             ageSums[product.name] / ageCounts[product.name] :
             midAge
@@ -54,7 +54,7 @@ function makeContext(catalog, users) {
     )
     
     
-    return {catalog,
+    return {product,
         users,
         colorIndex,
         categoriesIndex,
@@ -81,49 +81,95 @@ function encodeProduct(product, context) {
             context.maxPrice
         ) * WEIGHTS.price
     ]);
-
+    
     const age = tf.tensor1d([
         (
             context.productAvgAgeNorm[product.name] ?? 0.5
         ) * WEIGHTS.age
     ]);
-
+    
     const category = oneHotWeighted(
         context.categoriesIndex[product.category],
         context.numCategories,
         WEIGHTS.category
     );
-
+    
     const color = oneHotWeighted(
         context.colorIndex[product.color],
         context.numColors,
         WEIGHTS.color
     );
-    
+    const test = tf.concat(
+        [price, age, category, color]
+    )
+    console.log('Encoded product tensor:', test.dataSync());
     return tf.concat(
         [price, age, category, color]
     );
 }
+
+function encodeUser(user, context) {
+    // New tensor
+    if(user.purchases.length) {
+        return tf.stack(
+            user.purchases.map(
+                product => encodeProduct(product, context))
+            )
+            .mean(0)
+            .reshape([
+                1,
+                context.dimentions
+            ])
+    }
+};
+        
+function createTrainingData(context) {
+    const inputs = []
+    const labels = []
+    context.users.forEach(user => {
+        const userVector = encodeUser(user, context).dataSync()
+        context.product.forEach(product => {
+            const productVector = encodeProduct(product, context)
+            .dataSync()
+            const label = user.purchases.some(
+                p => p.name === product.name ?
+                1 : 
+                0
+            )
+        inputs.push([...userVector, ...productVector])
+        labels.push(label)
+        })
+    })
+    return {
+        xs: tf.tensor2d(inputs),
+        ys: tf.tensor2d(labels, [labels.length, 1]),
+        inputDimention: context.dimentions * 2,
+        // size = userVector + productVector
+    }
+}
+
 async function trainModel({ users }) {
     console.log('Training model with users:', users)
     
     postMessage({ type: workerEvents.progressUpdate, progress: { progress: 50 } });
-    const catalog = await((await fetch('/data/products.json')).json());
+    const product = await((await fetch('/data/products.json')).json());
     // const users = await((await fetch('/data/users.json')).json());
     
     // Map 
-    const context = makeContext(catalog, users);
+    const context = makeContext(product, users);
 
     // transform to tensors in TensorFlow.js
-    context.productVectors = catalog.map(product => {
+    context.productVectors = product.map(product => {
         return {
             name: product.name,
             meta: {...product},
             vector: encodeProduct(product, context).dataSync()
         }
     });
+    const trainData = createTrainingData(context);
+    debugger;
+    _globalCtx = context;
 
-    debugger
     postMessage({
         type: workerEvents.trainingLog,
         epoch: 1,
