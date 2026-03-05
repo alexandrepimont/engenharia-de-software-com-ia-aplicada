@@ -3,7 +3,7 @@ import { workerEvents } from '../events/constants.js';
 
 console.log('Model training worker initialized');
 let _globalCtx = {};
-
+let _model = null;
 const WEIGHTS = {
     category: 0.4,
     color: 0.3,
@@ -47,14 +47,15 @@ function makeContext(product, users) {
     const productAvgAgeNorm = Object.fromEntries(
         product.map(product => {
             const avg = ageCounts[product.name] ?
-            ageSums[product.name] / ageCounts[product.name] :
-            midAge
+                ageSums[product.name] / ageCounts[product.name] :
+                midAge
             return [product.name, normalize(avg, minAge, maxAge)]
         })
     )
     
     
-    return {product,
+    return {
+        product,
         users,
         colorIndex,
         categoriesIndex,
@@ -76,7 +77,8 @@ function encodeProduct(product, context) {
     // normalizando dados para ficar de 0 a 1
     // aplicar peso na recomendacao
     const price = tf.tensor1d([
-        normalize(product.price, 
+        normalize(
+            product.price, 
             context.minPrice, 
             context.maxPrice
         ) * WEIGHTS.price
@@ -99,10 +101,7 @@ function encodeProduct(product, context) {
         context.numColors,
         WEIGHTS.color
     );
-    const test = tf.concat(
-        [price, age, category, color]
-    )
-    console.log('Encoded product tensor:', test.dataSync());
+
     return tf.concat(
         [price, age, category, color]
     );
@@ -121,25 +120,39 @@ function encodeUser(user, context) {
                 context.dimentions
             ])
     }
+    return tf.concat1d(
+        [
+            tf.zeros([1]), // preço é ignorado,
+            tf.tensor1d([
+                normalize(user.age, context.minAge, context.maxAge)
+                * WEIGHTS.age
+            ]),
+            tf.zeros([context.numCategories]), // categoria ignorada,
+            tf.zeros([context.numColors]), // color ignorada,
+
+        ]
+    ).reshape([1, context.dimentions])
 };
         
 function createTrainingData(context) {
     const inputs = []
     const labels = []
-    context.users.forEach(user => {
-        const userVector = encodeUser(user, context).dataSync()
-        context.product.forEach(product => {
-            const productVector = encodeProduct(product, context)
-            .dataSync()
-            const label = user.purchases.some(
-                p => p.name === product.name ?
-                1 : 
-                0
-            )
-        inputs.push([...userVector, ...productVector])
-        labels.push(label)
+    context.users
+        .filter(u => u.purchases.length) // only users with purchases
+        .forEach(user => {
+            const userVector = encodeUser(user, context).dataSync()
+            context.product.forEach(product => {
+                const productVector = encodeProduct(product, context)
+                .dataSync()
+                const label = user.purchases.some(
+                    purchase => purchase.name === product.name ?
+                    1 : 
+                    0
+                )
+            inputs.push([...userVector, ...productVector])
+            labels.push(label)
+            })
         })
-    })
     return {
         xs: tf.tensor2d(inputs),
         ys: tf.tensor2d(labels, [labels.length, 1]),
@@ -147,16 +160,82 @@ function createTrainingData(context) {
         // size = userVector + productVector
     }
 }
+async function configureNeuralNetAndTrain(trainData) {
+
+    const model = tf.sequential()
+    // Camada de entrada
+    // - inputShape: Número de features por exemplo de treino (trainData.inputDim)
+    //   Exemplo: Se o vetor produto + usuário = 20 números, então inputDim = 20
+    // - units: 128 neurônios (muitos "olhos" para detectar padrões)
+    // - activation: 'relu' (mantém apenas sinais positivos, ajuda a aprender padrões não-lineares)
+    model.add(
+        tf.layers.dense({
+            inputShape: [trainData.inputDimention],
+            units: 128,
+            activation: 'relu'
+        })
+    )
+    // Camada oculta 1
+    // - 64 neurônios (menos que a primeira camada: começa a comprimir informação)
+    // - activation: 'relu' (ainda extraindo combinações relevantes de features)
+    model.add(
+        tf.layers.dense({
+            units: 64,
+            activation: 'relu'
+        })
+    )
+
+    // Camada oculta 2
+    // - 32 neurônios (mais estreita de novo, destilando as informações mais importantes)
+    //   Exemplo: De muitos sinais, mantém apenas os padrões mais fortes
+    // - activation: 'relu'
+    model.add(
+        tf.layers.dense({
+            units: 32,
+            activation: 'relu'
+        })
+    )
+    // Camada de saída
+    // - 1 neurônio porque vamos retornar apenas uma pontuação de recomendação
+    // - activation: 'sigmoid' comprime o resultado para o intervalo 0–1
+    //   Exemplo: 0.9 = recomendação forte, 0.1 = recomendação fraca
+    model.add(
+        tf.layers.dense({ units: 1, activation: 'sigmoid' })
+    )
+
+    model.compile({
+        optimizer: tf.train.adam(0.01),
+        loss: 'binaryCrossentropy',
+        metrics: ['accuracy']
+    })
+
+    await model.fit(trainData.xs, trainData.ys, {
+        epochs: 100,
+        batchSize: 32,
+        shuffle: true,
+        callbacks: {
+            onEpochEnd: (epoch, logs) => {
+                postMessage({
+                    type: workerEvents.trainingLog,
+                    epoch: epoch,
+                    loss: logs.loss,
+                    accuracy: logs.acc
+                });
+            }
+        }
+    })
+
+    return model
+}
 
 async function trainModel({ users }) {
     console.log('Training model with users:', users)
     
-    postMessage({ type: workerEvents.progressUpdate, progress: { progress: 50 } });
+    postMessage({ type: workerEvents.progressUpdate, progress: { progress: 1 } });
     const product = await((await fetch('/data/products.json')).json());
-    // const users = await((await fetch('/data/users.json')).json());
     
     // Map 
-    const context = makeContext(product, users);
+    const context = makeContext(product, users)
 
     // transform to tensors in TensorFlow.js
     context.productVectors = product.map(product => {
@@ -167,22 +246,10 @@ async function trainModel({ users }) {
         }
     });
     const trainData = createTrainingData(context);
-    debugger;
+    _model = await configureNeuralNetAndTrain(trainData);
     _globalCtx = context;
-
-    postMessage({
-        type: workerEvents.trainingLog,
-        epoch: 1,
-        loss: 1,
-        accuracy: 1
-    });
-
-    setTimeout(() => {
-        postMessage({ type: workerEvents.progressUpdate, progress: { progress: 100 } });
-        postMessage({ type: workerEvents.trainingComplete });
-    }, 1000);
-
-
+    postMessage({ type: workerEvents.progressUpdate, progress: { progress: 100 } });
+    postMessage({ type: workerEvents.trainingComplete });
 }
 function recommend(user, ctx) {
     console.log('will recommend for user:', user)
