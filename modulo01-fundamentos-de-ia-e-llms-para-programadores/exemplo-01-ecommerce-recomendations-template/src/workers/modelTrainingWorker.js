@@ -251,8 +251,28 @@ async function trainModel({ users }) {
     postMessage({ type: workerEvents.progressUpdate, progress: { progress: 100 } });
     postMessage({ type: workerEvents.trainingComplete });
 }
-function recommend(user, ctx) {
+function recommend({user}) {
+    if (!_model) return;
+    const context = _globalCtx;
+    const userVector = encodeUser(user, context).dataSync();
     console.log('will recommend for user:', user)
+    const inputs = context.productVectors.map(({vector}) => {
+        return [...userVector, ...vector]
+    })
+    const inputTensor = tf.tensor2d(inputs);
+    const predictions = _model.predict(inputTensor);
+
+    const scores = predictions.dataSync();
+    const recommendations = context.productVectors.map((item, index) => {
+        return {
+            ...item.meta,
+            name: item.name,
+            score: scores[index]
+        }
+    })
+    const sortedItems = recommendations.sort((a, b) => b.score - a.score);
+    postMessage({ type: workerEvents.recommend, user, recommendations: sortedItems });
+
     // postMessage({
     //     type: workerEvents.recommend,
     //     user,
@@ -263,7 +283,7 @@ function recommend(user, ctx) {
 
 const handlers = {
     [workerEvents.trainModel]: trainModel,
-    [workerEvents.recommend]: d => recommend(d.user, _globalCtx),
+    [workerEvents.recommend]: recommend,
 };
 
 self.onmessage = e => {
