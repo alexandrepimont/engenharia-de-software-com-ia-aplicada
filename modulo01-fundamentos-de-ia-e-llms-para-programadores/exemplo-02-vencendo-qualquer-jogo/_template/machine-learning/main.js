@@ -34,7 +34,7 @@ export default async function main(game) {
             image: bitmap,
         }, [bitmap]);
 
-    }, 200); // every 200ms
+    }, 300); // every 200ms
 
     return container;
 }
